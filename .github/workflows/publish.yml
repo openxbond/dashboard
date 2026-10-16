@@ -1,0 +1,123 @@
+name: Publish compiled dashboard
+
+on:
+  repository_dispatch:
+    types: [publish-artifact]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public artifact version tag
+        required: true
+        type: string
+      sha:
+        description: Expected public artifact commit SHA (40 characters)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dashboard-publish
+  cancel-in-progress: false
+  queue: max
+
+env:
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+  EXPECTED_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: publisher
+          persist-credentials: false
+      - name: Validate requested immutable version
+        working-directory: publisher/.github/scripts
+        run: |
+          python -m unittest discover -p 'test_*.py'
+          python - <<'PY'
+          import json, os, re, subprocess
+          from artifact import validate_tag
+          validate_tag(os.environ['TAG'])
+          sha = os.environ['EXPECTED_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              raise ValueError('Expected a complete public commit SHA')
+          ref = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/ref/tags/' + os.environ['TAG']]))
+          if ref['object']['type'] != 'commit' or ref['object']['sha'] != sha:
+              raise ValueError('Public artifact tag does not match the requested commit')
+          PY
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          path: artifact
+          persist-credentials: false
+      - name: Check and extract compiled archive
+        run: |
+          python publisher/.github/scripts/artifact.py validate artifact/dashboard.zip artifact/SHA256SUMS --extract site
+          cp publisher/LICENSE site/LICENSE
+      - name: Publish Release as github-actions bot
+        run: python publisher/.github/scripts/release.py "$TAG" artifact
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  pages:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: publisher
+          persist-credentials: false
+      - name: Keep Pages on the highest stable release
+        id: current
+        run: |
+          latest=$(python publisher/.github/scripts/release.py latest)
+          if [ "$TAG" = "$latest" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skip Pages for $TAG; latest stable release is $latest"
+          fi
+      - uses: actions/download-artifact@v8
+        if: steps.current.outputs.deploy == 'true'
+        with:
+          name: github-pages
+          path: pages-artifact
+      - name: Restore verified Pages artifact
+        if: steps.current.outputs.deploy == 'true'
+        run: |
+          mkdir site
+          tar -xf pages-artifact/artifact.tar -C site
+      - uses: actions/checkout@v7
+        if: steps.current.outputs.deploy == 'true'
+        with:
+          ref: gh-pages
+          path: deployed
+      - name: Update CDN branch with compiled files
+        if: steps.current.outputs.deploy == 'true'
+        run: |
+          rsync -a --delete --exclude='.git' site/ deployed/
+          cd deployed
+          git config user.name openxbond
+          git config user.email noreply@xbond.net
+          git add -A
+          if ! git diff --cached --quiet; then
+            git -c core.hooksPath=/dev/null commit -m "Deploy $TAG"
+            git push origin HEAD:gh-pages
+          fi
+      - uses: actions/deploy-pages@v5
+        if: steps.current.outputs.deploy == 'true'
+        id: deployment
