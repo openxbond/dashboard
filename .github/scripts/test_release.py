@@ -13,6 +13,25 @@ def record(tag, **overrides):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_new_draft_is_loaded_from_authenticated_list_before_publication(self):
+        existing = record("v0.3.0", draft=True)
+        created, published = False, False
+        def api(*args):
+            nonlocal created, published
+            if args[:2] == ("release", "create"):
+                created = True
+            elif args[:2] == ("release", "edit") and "--draft=false" in args:
+                published = True
+            elif args[0] == "api" and "--paginate" in args:
+                return json.dumps([[existing]] if created else [[]])
+            elif args[0] == "api":
+                self.assertTrue(published, "Drafts must not be loaded from the tag endpoint")
+                return json.dumps(existing)
+            return ""
+        with patch.object(release, "gh", side_effect=api):
+            release.publish("openxbond/dashboard", "v0.3.0", ".")
+        self.assertTrue(created and published)
+
     def test_latest_uses_semver_across_pages_and_ignores_drafts_and_prereleases(self):
         pages = [[record("v0.9.0"), record("v9.0.0", draft=True)],
                  [record("v0.10.0"), record("v1.0.0-rc.1", prerelease=True), record("other")]]

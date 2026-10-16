@@ -42,7 +42,9 @@ def publish(repo, tag, directory):
         if prerelease:
             args.append("--prerelease")
         gh(*args)
-        existing = json.loads(gh("api", f"repos/{repo}/releases/tags/{tag}"))
+        # The tag endpoint can return 404 for drafts; enumerate authenticated releases.
+        releases = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"))
+        existing = next(r for page in releases for r in page if r["tag_name"] == tag)
     # Validate every existing asset before making any upload or publication mutation.
     assets = {asset["name"]: asset for asset in existing["assets"]}
     for name in ("dashboard.zip", "SHA256SUMS"):
